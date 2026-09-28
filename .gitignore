@@ -97,3 +97,6 @@ Thumbs.db
 .env.test
 .env*.local
 *.env
+
+# Worktrees locais de desenvolvimento
+.worktrees/

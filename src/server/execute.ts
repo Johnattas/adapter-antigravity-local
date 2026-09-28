@@ -39,6 +39,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_ANTIGRAVITY_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { firstNonEmptyLine } from "../utils.js";
+import { parseAntigravityOutput } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -144,7 +145,7 @@ function compileAgyArguments(
   sandbox: boolean,
   extraArgs: string[]
 ): string[] {
-  const args = ["--print", prompt];
+  const args = ["--print", prompt, "--output-format", "stream-json"];
   if (resumeSessionId) {
     args.push("--conversation", resumeSessionId);
   }
@@ -335,13 +336,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     const failed = (proc.exitCode ?? 0) !== 0;
-    const rawStdout = proc.stdout.trim();
     const rawStderr = proc.stderr.trim();
     const fallbackErrorMessage = firstNonEmptyLine(rawStderr) || `Antigravity exited with code ${proc.exitCode ?? -1}`;
+    const parsed = parseAntigravityOutput(proc.stdout, proc.stderr);
+    const effectiveErrorMessage = parsed.errorMessage ?? (failed ? fallbackErrorMessage : null);
+    const effectiveSessionId = parsed.sessionId || sessionId;
 
-    const resolvedSessionParams = sessionId
+    const resolvedSessionParams = effectiveSessionId
       ? {
-          sessionId,
+          sessionId: effectiveSessionId,
           cwd: effectiveExecutionCwd,
           ...(asString(workspaceContext.workspaceId, "") ? { workspaceId: workspaceContext.workspaceId } : {}),
           ...(executionTargetIsRemote ? { remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget) } : {}),
@@ -352,19 +355,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
-      errorMessage: failed ? fallbackErrorMessage : null,
-      errorCode: null,
-      usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
-      sessionId: sessionId || null,
+      errorMessage: effectiveErrorMessage,
+      errorCode: parsed.permissionDeniedFailure
+        ? "antigravity_permission_denied"
+        : null,
+      usage: parsed.usage ?? { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+      sessionId: effectiveSessionId || null,
       sessionParams: resolvedSessionParams,
-      sessionDisplayId: sessionId || null,
+      sessionDisplayId: effectiveSessionId || null,
       provider: "google",
       biller: "google",
       model,
       billingType: "api",
       costUsd: null,
-      resultJson: { raw: rawStdout },
-      summary: failed ? "" : rawStdout,
+      resultJson: {
+        result: parsed.response,
+        session_id: parsed.sessionId,
+        usage: parsed.usage ?? null,
+        denied_action_count: parsed.deniedActionCount,
+        denied_action_types: parsed.deniedActionTypes,
+      },
+      summary: effectiveErrorMessage ? "" : parsed.response,
       question: null,
       clearSession: false,
     };

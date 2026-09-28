@@ -8,6 +8,130 @@
 
 import { parseMultilineLines } from "../utils.js";
 
+export interface ParsedAntigravityOutput {
+  sessionId: string | null;
+  response: string;
+  errorMessage: string | null;
+  permissionDeniedFailure: boolean;
+  deniedActionCount: number;
+  deniedActionTypes: string[];
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens?: number;
+  };
+}
+
+function parseJsonLine(rawLine: string): Record<string, unknown> | null {
+  const line = rawLine.replace(/\u001B\[[0-?]*[ -\/]*[@-~]/g, "").trim();
+  if (!line) return null;
+
+  try {
+    const value: unknown = JSON.parse(line);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseUsage(value: unknown): ParsedAntigravityOutput["usage"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const readCount = (candidate: unknown): number | null => {
+    const count = Number(candidate ?? 0);
+    return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : null;
+  };
+  const inputTokens = readCount(raw.input_tokens ?? raw.inputTokens);
+  const outputTokens = readCount(raw.output_tokens ?? raw.outputTokens);
+  const cachedInputTokens = readCount(raw.cache_read_tokens ?? raw.cachedInputTokens);
+  if (inputTokens === null || outputTokens === null || cachedInputTokens === null) return undefined;
+  return { inputTokens, outputTokens, cachedInputTokens };
+}
+
+function readDeniedActionTypes(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "desconhecida";
+    const action = (entry as Record<string, unknown>).action;
+    const normalized = typeof action === "string" ? action.trim() : "";
+    return /^[a-z0-9_.:-]{1,64}$/i.test(normalized) ? normalized : "desconhecida";
+  });
+}
+
+/**
+ * Interpreta NDJSON e o objeto JSON final do agy sem devolver o envelope bruto
+ * como mensagem do assistente. Saída textual simples permanece compatível.
+ */
+export function parseAntigravityOutput(stdout: string, stderr: string): ParsedAntigravityOutput {
+  let sessionId: string | null = null;
+  let response = "";
+  let errorMessage: string | null = null;
+  let usage: ParsedAntigravityOutput["usage"];
+  const deniedActionTypes: string[] = [];
+  const plainTextLines: string[] = [];
+  let foundStructuredOutput = false;
+  let permissionDeniedFailure = false;
+
+  const consumeResult = (result: Record<string, unknown>) => {
+    if (result.conversation_id) sessionId = String(result.conversation_id).trim() || sessionId;
+    if (typeof result.response === "string" && result.response.trim()) response = result.response.trim();
+    usage = parseUsage(result.usage) ?? usage;
+    deniedActionTypes.push(...readDeniedActionTypes(result.denied_actions ?? result.deniedActions));
+    if (String(result.status ?? "").toLowerCase() === "error") {
+      errorMessage = String(result.error ?? result.response ?? "Falha na execução do Antigravity");
+    }
+  };
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const data = parseJsonLine(rawLine);
+    if (!data) {
+      const line = rawLine.trim();
+      if (line) plainTextLines.push(line);
+      continue;
+    }
+
+    foundStructuredOutput = true;
+    if (data.event === "init" && data.conversation_id) {
+      sessionId = String(data.conversation_id).trim() || sessionId;
+    }
+    if (data.event === "step_update" && data.step_update && typeof data.step_update === "object") {
+      const update = data.step_update as Record<string, unknown>;
+      if (!sessionId && update.conversation_id) sessionId = String(update.conversation_id).trim();
+      if (update.step_type === "agent_response" && typeof update.text_delta === "string") {
+        response += update.text_delta;
+      }
+      usage = parseUsage(update.usage) ?? usage;
+    }
+    if (data.event === "result" && data.result && typeof data.result === "object" && !Array.isArray(data.result)) {
+      consumeResult(data.result as Record<string, unknown>);
+    } else if ("status" in data || "response" in data || "denied_actions" in data || "deniedActions" in data) {
+      consumeResult(data);
+    }
+  }
+
+  if (!foundStructuredOutput && !response) response = plainTextLines.join("\n");
+  if (!errorMessage && !response.trim() && deniedActionTypes.length > 0) {
+    permissionDeniedFailure = true;
+    const tipos = [...new Set(deniedActionTypes)].join(", ");
+    errorMessage = `Antigravity não produziu resposta porque ${deniedActionTypes.length} ação(ões) foi(ram) negada(s)${tipos ? ` (${tipos})` : ""}. Revise as permissões ou ajuste a tarefa.`;
+  }
+  if (!errorMessage && /(?:error|fatal|exception)\s*:/i.test(stderr)) {
+    errorMessage = stderr.trim();
+  }
+
+  return {
+    sessionId,
+    response: response.trim(),
+    errorMessage,
+    permissionDeniedFailure,
+    deniedActionCount: deniedActionTypes.length,
+    deniedActionTypes: [...new Set(deniedActionTypes)],
+    usage,
+  };
+}
+
 /**
  * Combines and normalizes stdout and stderr into a single list of trimmed, non-empty lines.
  * Reusable utility to avoid duplicate output merging logic.

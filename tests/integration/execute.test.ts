@@ -90,7 +90,53 @@ describe("antigravity local execution", () => {
     const callArgs = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [string, unknown, string, string[]];
     const cliArgs = callArgs[3];
     expect(cliArgs).toContain("--print");
+    expect(cliArgs).toContain("--output-format");
+    expect(cliArgs).toContain("stream-json");
     expect(cliArgs).toContain("--dangerously-skip-permissions");
+  });
+
+  it("sinaliza falha estruturada quando o agy nega ação e não responde", async () => {
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout: JSON.stringify({
+        status: "SUCCESS",
+        response: "",
+        denied_actions: [{ action: "command", command: "conteúdo sensível" }],
+      }),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute({
+      runId: "run-denied-1",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Antigravity CEO",
+        adapterType: "antigravity_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "agy" },
+      context: {
+        paperclipWorkspace: { cwd: "/home/user/workspace", source: "project_primary" },
+      },
+      onLog: async () => {},
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBe("antigravity_permission_denied");
+    expect(result.errorMessage).toContain("ação(ões)");
+    expect(result.errorMessage).not.toContain("conteúdo sensível");
+    expect(result.summary).toBe("");
+    expect(result.resultJson).toMatchObject({
+      result: "",
+      denied_action_count: 1,
+      denied_action_types: ["command"],
+    });
   });
 
   /**

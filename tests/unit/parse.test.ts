@@ -5,6 +5,7 @@ import {
   detectAntigravityQuotaExhausted,
   isAntigravityTurnLimitResult,
   describeAntigravityFailure,
+  parseAntigravityOutput,
 } from "../../src/server/parse.js";
 
 /**
@@ -12,6 +13,69 @@ import {
  * Validates extraction of authentication needs, quota status, turn limits, and failure reasons.
  */
 describe("parse server helpers", () => {
+  describe("parseAntigravityOutput", () => {
+    it("converte ações negadas sem resposta em erro visível e sanitizado", () => {
+      const stdout = JSON.stringify({
+        status: "SUCCESS",
+        response: "",
+        denied_actions: [{ action: "command", command: "segredo --token abc" }],
+      });
+
+      const result = parseAntigravityOutput(stdout, "");
+
+      expect(result.response).toBe("");
+      expect(result.permissionDeniedFailure).toBe(true);
+      expect(result.deniedActionCount).toBe(1);
+      expect(result.deniedActionTypes).toEqual(["command"]);
+      expect(result.errorMessage).toContain("1 ação(ões)");
+      expect(result.errorMessage).toContain("command");
+      expect(result.errorMessage).not.toContain("segredo");
+      expect(result.errorMessage).not.toContain("token");
+    });
+
+    it("não inclui um tipo de ação arbitrário na mensagem de erro", () => {
+      const stdout = JSON.stringify({
+        status: "SUCCESS",
+        response: "",
+        denied_actions: [{ action: "command com segredo interno" }],
+      });
+
+      const result = parseAntigravityOutput(stdout, "");
+
+      expect(result.deniedActionTypes).toEqual(["desconhecida"]);
+      expect(result.errorMessage).not.toContain("segredo interno");
+    });
+
+    it("mantém sucesso quando o agente se recupera e fornece resposta", () => {
+      const stdout = JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "Consegui concluir por outro caminho.",
+          denied_actions: [{ action: "command", command: "não divulgar" }],
+          usage: { input_tokens: 12, output_tokens: 5, cache_read_tokens: 2 },
+        },
+      });
+
+      expect(parseAntigravityOutput(stdout, "")).toEqual({
+        sessionId: null,
+        response: "Consegui concluir por outro caminho.",
+        errorMessage: null,
+        permissionDeniedFailure: false,
+        deniedActionCount: 1,
+        deniedActionTypes: ["command"],
+        usage: { inputTokens: 12, outputTokens: 5, cachedInputTokens: 2 },
+      });
+    });
+
+    it("preserva compatibilidade com saída textual simples", () => {
+      expect(parseAntigravityOutput("Resposta em texto simples", "")).toMatchObject({
+        response: "Resposta em texto simples",
+        errorMessage: null,
+        deniedActionCount: 0,
+      });
+    });
+  });
   
   /**
    * Tests for session resume failure detection.
