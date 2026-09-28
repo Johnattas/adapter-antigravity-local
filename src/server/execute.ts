@@ -34,7 +34,9 @@ import {
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   parseObject,
+  renderPaperclipWakePrompt,
   renderTemplate,
+  sanitizeInheritedPaperclipEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_ANTIGRAVITY_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -42,6 +44,57 @@ import { firstNonEmptyLine } from "../utils.js";
 import { parseAntigravityOutput } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE = [
+  "You are agent {{agent.id}} ({{agent.name}}). Continue the Paperclip conversation described in the supplied wake payload.",
+  "Respond to the user's latest message before doing unrelated exploration. Use issue-thread interactions when structured questions or explicit confirmation are required.",
+  "Use the injected PAPERCLIP_API_URL, PAPERCLIP_API_KEY, PAPERCLIP_TASK_ID and PAPERCLIP_RUN_ID for Paperclip operations.",
+  "Never discover Paperclip endpoints by reading its source code, read instance secrets, or construct authentication tokens manually. If a required runtime binding is absent, stop promptly and report the missing binding.",
+  "Do not treat a conversation as an ordinary execution task. Respect planning/read-only gates, explicit approvals, budget, pause/cancel, and company boundaries.",
+].join("\n");
+
+function runtimeTaskId(context: Record<string, unknown>): string {
+  const issue = parseObject(context.paperclipIssue);
+  const wake = parseObject(context.paperclipWake);
+  const wakeIssue = parseObject(wake.issue);
+  return (
+    asString(context.taskId, "").trim() ||
+    asString(context.issueId, "").trim() ||
+    asString(issue.id, "").trim() ||
+    asString(wakeIssue.id, "").trim()
+  );
+}
+
+function applyTrustedPaperclipRuntimeEnv(
+  env: Record<string, string>,
+  runId: string,
+  agent: AdapterAgent,
+  context: Record<string, unknown>,
+  authToken: string | null | undefined,
+): void {
+  Object.assign(env, buildPaperclipEnv(agent));
+  env.PAPERCLIP_RUN_ID = runId;
+
+  const taskId = runtimeTaskId(context);
+  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
+  else delete env.PAPERCLIP_TASK_ID;
+
+  if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  else delete env.PAPERCLIP_API_KEY;
+}
+
+function assertConversationRuntimeBindings(
+  context: Record<string, unknown>,
+  authToken: string | null | undefined,
+): void {
+  if (context.conversationMode !== true) return;
+  if (!runtimeTaskId(context)) {
+    throw new Error("Paperclip conversation is missing PAPERCLIP_TASK_ID context");
+  }
+  if (!authToken) {
+    throw new Error("Paperclip conversation is missing its ephemeral PAPERCLIP_API_KEY");
+  }
+}
 
 /**
  * Resolves the effective working directory (CWD) paths based on agent instructions, 
@@ -83,19 +136,19 @@ function buildExecutionEnvironment(
   agent: AdapterAgent,
   config: Record<string, unknown>,
   model: string,
+  context: Record<string, unknown>,
   authToken: string | null | undefined
 ): { env: Record<string, string>; envConfig: Record<string, unknown> } {
-  const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
-  env.PAPERCLIP_RUN_ID = runId;
+  const envConfig = { ...parseObject(config.env) };
+  delete envConfig.PAPERCLIP_API_KEY;
+  delete envConfig.PAPERCLIP_WAKE_PAYLOAD_JSON;
+  const env: Record<string, string> = {};
 
   if (model && model !== DEFAULT_ANTIGRAVITY_LOCAL_MODEL) {
     env.ANTIGRAVITY_MODEL = model;
   }
 
-  if (authToken && typeof envConfig.PAPERCLIP_API_KEY !== "string") {
-    env.PAPERCLIP_API_KEY = authToken;
-  }
+  applyTrustedPaperclipRuntimeEnv(env, runId, agent, context, authToken);
 
   return { env, envConfig };
 }
@@ -113,7 +166,8 @@ function compileAgentPrompt(
   promptTemplate: string,
   agent: AdapterAgent,
   runId: string,
-  context: Record<string, unknown>
+  context: Record<string, unknown>,
+  resumedSession: boolean,
 ): string {
   const templateData = {
     agentId: agent.id,
@@ -124,7 +178,15 @@ function compileAgentPrompt(
   };
 
   const renderedPrompt = renderTemplate(promptTemplate, templateData);
-  return joinPromptSections([renderedPrompt]);
+  const conversationPrompt =
+    context.conversationMode === true &&
+    promptTemplate !== DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+      ? renderTemplate(DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE, templateData)
+      : "";
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+    resumedSession,
+  });
+  return joinPromptSections([renderedPrompt, conversationPrompt, wakePrompt]);
 }
 
 /**
@@ -184,16 +246,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
 
-  const promptTemplate = asString(config.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
+  const configuredPromptTemplate = asString(config.promptTemplate, "").trim();
+  const useConversationTemplate =
+    context.conversationMode === true &&
+    (!configuredPromptTemplate || configuredPromptTemplate === DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
+  const promptTemplate = useConversationTemplate
+    ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
+    : configuredPromptTemplate || DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
   const command = asString(config.command, "agy");
   const model = asString(config.model, DEFAULT_ANTIGRAVITY_LOCAL_MODEL).trim();
   const sandbox = asBoolean(config.sandbox, false);
+
+  assertConversationRuntimeBindings(context, authToken);
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const { cwd, effectiveWorkspaceCwd } = await resolveEffectiveCwd(config, workspaceContext);
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
 
-  const { env, envConfig } = buildExecutionEnvironment(runId, agent, config, model, authToken);
+  const { env, envConfig } = buildExecutionEnvironment(runId, agent, config, model, context, authToken);
 
   refreshPaperclipWorkspaceEnvForExecution({
     env,
@@ -208,9 +278,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  // Configuração do agente é aplicada durante o refresh. Reaplique por último
+  // as vinculações emitidas pelo Paperclip para impedir sobrescrita ou spoofing.
+  applyTrustedPaperclipRuntimeEnv(env, runId, agent, context, authToken);
 
   const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
+    Object.entries({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
     ),
   );
@@ -291,7 +364,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const sessionId = canResumeSession ? runtimeSessionId : null;
 
-  const prompt = compileAgentPrompt(promptTemplate, agent, runId, context);
+  const prompt = compileAgentPrompt(promptTemplate, agent, runId, context, Boolean(sessionId));
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const workspaces = Array.isArray(context.paperclipWorkspaces) ? context.paperclipWorkspaces : [];

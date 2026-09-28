@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE } from "@paperclipai/adapter-utils/server-utils";
+import { createServerAdapter } from "../../src/index.js";
 import { execute } from "../../src/server/execute.js";
 
 const {
@@ -227,5 +229,154 @@ describe("antigravity local execution", () => {
     expect(addDirIndices.length).toBe(2);
     expect(cliArgs[addDirIndices[0] + 1]).toBe("/home/user/workspace-1");
     expect(cliArgs[addDirIndices[1] + 1]).toBe("/home/user/workspace-2");
+  });
+
+  it("declara suporte à credencial JWT local emitida pelo Paperclip", () => {
+    expect(createServerAdapter().supportsLocalAgentJwt).toBe(true);
+  });
+
+  it("injeta identidade confiável da execução sem permitir sobrescrita pela configuração", async () => {
+    await execute({
+      runId: "run-chat-1",
+      agent: {
+        id: "agent-trusted",
+        companyId: "company-trusted",
+        name: "Líder de Ambiente",
+        adapterType: "antigravity_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "agy",
+        env: {
+          PAPERCLIP_API_KEY: "chave-configurada-nao-confiavel",
+          PAPERCLIP_RUN_ID: "run-forjado",
+          PAPERCLIP_TASK_ID: "task-forjada",
+          PAPERCLIP_AGENT_ID: "agent-forjado",
+        },
+      },
+      context: {
+        taskId: "chat-issue-1",
+        paperclipWorkspace: { cwd: "/home/user/workspace", source: "agent_home" },
+      },
+      authToken: "jwt-efemero-oficial",
+      onLog: async () => {},
+    });
+
+    const callArgs = runAdapterExecutionTargetProcess.mock.calls[0] as unknown as [
+      string,
+      unknown,
+      string,
+      string[],
+      { env: Record<string, string> },
+    ];
+    expect(callArgs[4].env).toMatchObject({
+      PAPERCLIP_API_KEY: "jwt-efemero-oficial",
+      PAPERCLIP_RUN_ID: "run-chat-1",
+      PAPERCLIP_TASK_ID: "chat-issue-1",
+      PAPERCLIP_AGENT_ID: "agent-trusted",
+      PAPERCLIP_COMPANY_ID: "company-trusted",
+    });
+  });
+
+  it("usa contrato de conversa e inclui a mensagem recebida no wake payload", async () => {
+    const onMeta = vi.fn(async () => {});
+    await execute({
+      runId: "run-chat-2",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Líder de Ambiente",
+        adapterType: "antigravity_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: "agy",
+        // O formulário do Paperclip pode persistir o default antigo explicitamente.
+        promptTemplate: DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+      },
+      context: {
+        conversationMode: true,
+        issueId: "chat-issue-2",
+        paperclipWorkspace: { cwd: "/home/user/workspace", source: "agent_home" },
+        paperclipWake: {
+          reason: "comment_added",
+          issue: { id: "chat-issue-2", identifier: "ENG-44", title: "Chat", status: "in_progress" },
+          commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+          comments: [{ id: "comment-1", body: "INICIAR_PLANEJAMENTO_ASSISTIDO_V1", authorType: "user" }],
+          fallbackFetchNeeded: false,
+        },
+      },
+      authToken: "jwt-oficial",
+      onLog: async () => {},
+      onMeta,
+    });
+
+    const prompt = onMeta.mock.calls[0]?.[0]?.prompt as string;
+    expect(prompt).toContain("Continue the Paperclip conversation");
+    expect(prompt).toContain("INICIAR_PLANEJAMENTO_ASSISTIDO_V1");
+    expect(prompt).toContain("Never discover Paperclip endpoints by reading its source code");
+    expect(prompt).not.toContain("Start actionable work in this heartbeat; do not stop at a plan");
+  });
+
+  it("preserva prompt personalizado sem remover o contrato seguro de conversa", async () => {
+    const onMeta = vi.fn(async () => {});
+    await execute({
+      runId: "run-chat-custom",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Líder",
+        adapterType: "antigravity_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "agy", promptTemplate: "INSTRUÇÃO PERSONALIZADA {{agent.id}}" },
+      context: {
+        conversationMode: true,
+        taskId: "chat-custom",
+        paperclipWorkspace: { cwd: "/home/user/workspace", source: "agent_home" },
+      },
+      authToken: "jwt-oficial",
+      onLog: async () => {},
+      onMeta,
+    });
+
+    const prompt = onMeta.mock.calls[0]?.[0]?.prompt as string;
+    expect(prompt).toContain("INSTRUÇÃO PERSONALIZADA agent-1");
+    expect(prompt).toContain("Never discover Paperclip endpoints by reading its source code");
+  });
+
+  it.each([
+    {
+      label: "credencial efêmera",
+      context: { conversationMode: true, taskId: "chat-1" },
+      authToken: undefined,
+      expected: "PAPERCLIP_API_KEY",
+    },
+    {
+      label: "ID da conversa",
+      context: { conversationMode: true },
+      authToken: "jwt-oficial",
+      expected: "PAPERCLIP_TASK_ID",
+    },
+  ])("falha rapidamente quando falta $label", async ({ context, authToken, expected }) => {
+    await expect(execute({
+      runId: "run-chat-invalido",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Líder",
+        adapterType: "antigravity_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "agy" },
+      context,
+      authToken,
+      onLog: async () => {},
+    })).rejects.toThrow(expected);
+    expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
 });
